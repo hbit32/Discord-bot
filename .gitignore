@@ -1,0 +1,12 @@
+# 環境変数ファイル（トークン等の機密情報）
+.env
+.env.example
+# Python キャッシュ
+__pycache__/
+*.pyc
+*.pyo
+
+# 仮想環境
+venv/
+.venv/
+env/

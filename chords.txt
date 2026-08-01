@@ -1,0 +1,17 @@
+IV - V - IIIm - VIm
+VIm - IV - V - I
+IVM7 - III7 - VIm7 - I7
+I - V - VIm - IIIm - IV - I - IV - V
+I - V - VIm - IV
+I - V - IV - V
+I7 - IV7 - I7 - IV7 - V7 - IV7 - I7 - V7
+IV - V - I - III
+IVM7 - III7 - VIm7 - II7
+IVM7 - V7/IV - IIIm7 - VIm7
+VIIm - ♯IV - IV - ♯IV
+Im - II - V - Im
+Im - ♭VII - ♭VI - V
+Im - ♭IVm - V
+Im - ♭VI - V
+Im - Im/V - ♭VI - V
+
