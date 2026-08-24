@@ -10,3 +10,8 @@ __pycache__/
 venv/
 .venv/
 env/
+
+# ログファイル
+spam_logs/
+delete_logs/
+penalty_logs/
