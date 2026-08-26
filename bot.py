@@ -90,6 +90,25 @@ def write_penalty_log(member: discord.Member, penalty_type: str, reason: str, de
     print(f'[PENALTY] ログ記録: {log_path} ([{penalty_type}] {member.name})')
 
 
+def write_auth_log(member: discord.Member, channel, message_content: str, auth_type: str = "自己紹介投稿"):
+    """認証完了の履歴を日付別ファイルに追記する (auth_logs/YYYY-MM-DD.txt)"""
+    now      = datetime.now(timezone.utc).astimezone()
+    log_dir  = 'auth_logs'
+    log_path = os.path.join(log_dir, f"{now.strftime('%Y-%m-%d')}.txt")
+    os.makedirs(log_dir, exist_ok=True)
+    with open(log_path, 'a', encoding='utf-8') as f:
+        f.write(f"\n{'='*60}\n")
+        f.write(f"[認証日時] {now.strftime('%Y-%m-%d %H:%M:%S')}\n")
+        f.write(f"[ユーザー ] {member.display_name} ({member.name}, ID: {member.id})\n")
+        f.write(f"[チャンネル] #{channel.name} (ID: {channel.id})\n")
+        f.write(f"[認証方法] {auth_type}\n")
+        f.write(f"--- 認証メッセージ ---\n")
+        for line in message_content.strip().splitlines():
+            f.write(f"  {line}\n")
+        f.write(f"{'='*60}\n")
+    print(f'[AUTH] ログ記録: {log_path} ({member.name})')
+
+
 async def handle_spam(trigger_message: discord.Message, spam_messages: list):
     """スパム検知時の処理:
     - メッセージ削除 & delete_logs に記録
@@ -264,6 +283,10 @@ async def on_ready():
                             print(f'✨ {member.display_name} にロールを付与します (過去メッセージ検知)')
                             await member.add_roles(role, reason='起動時の過去メッセージ確認')
                             newly_authenticated_members.append(member)
+                            try:
+                                write_auth_log(member, channel, message.content, auth_type='起動時過去ログ確認')
+                            except Exception as log_err:
+                                print(f'[AUTH] ログ書き込み失敗: {log_err}')
 
             print('✅ 過去メッセージの確認完了')
 
@@ -359,6 +382,12 @@ async def on_message(message: discord.Message):
             # --- 認証成功 ---
             # ロールを付与
             await member.add_roles(role, reason='認証チャンネルでの申請')
+
+            # 認証履歴をファイルに記録 (auth_logs/YYYY-MM-DD.txt)
+            try:
+                write_auth_log(member, message.channel, message.content, auth_type='自己紹介投稿')
+            except Exception as log_err:
+                print(f'[AUTH] ログ書き込み失敗: {log_err}')
 
             # 成功通知（5秒後にBotのメッセージのみ削除）
             notice = await message.channel.send(
