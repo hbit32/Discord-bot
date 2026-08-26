@@ -331,28 +331,6 @@ async def on_message(message: discord.Message):
             asyncio.create_task(handle_spam(message, spam_messages))
             return
 
-    # /chord コマンドの処理（ガチャ機能）
-    if message.content.startswith('/chord'):
-        try:
-            with open('chords.txt', 'r', encoding='utf-8') as f:
-                lines = [line.strip() for line in f if line.strip()]
-
-            if lines:
-                chord_text = random.choice(lines)
-                # ランダムコード進行ガチャ
-                if " : " in chord_text:
-                    title, desc = chord_text.split(" : ", 1)
-                    reply_msg = f"**コード進行ガチャ**\n\n`{desc}`"
-                else:
-                    reply_msg = f"**コード進行ガチャ**\n\n`{chord_text}`"
-            else:
-                reply_msg = "テキストファイルにコード進行がありません！"
-        except FileNotFoundError:
-            reply_msg = "`chords.txt` が見つかりません！"
-
-        await message.channel.send(reply_msg)
-        return
-
     # 認証チャンネル以外のメッセージは無視
     if message.channel.id != AUTH_CHANNEL_ID:
         return
