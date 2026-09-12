@@ -11,10 +11,10 @@ from dotenv import load_dotenv
 load_dotenv()
 
 TOKEN           = os.getenv('DISCORD_TOKEN')
-AUTH_CHANNEL_ID = int(os.getenv('AUTH_CHANNEL_ID'))
-AUTH_ROLE_ID    = int(os.getenv('AUTH_ROLE_ID'))
-MUTE_ROLE_ID    = int(os.getenv('MUTE_ROLE_ID', 0))
-LOG_CHANNEL_ID  = int(os.getenv('LOG_CHANNEL_ID', 0))
+AUTH_CHANNEL_ID = 1514441527609266318
+AUTH_ROLE_ID    = 1514453293357727795
+MUTE_ROLE_ID    = 1541338109801664562
+LOG_CHANNEL_ID  = 1542367134556885042
 
 # スパム検知の設定
 SPAM_THRESHOLD = 5     # この件数以上でスパム判定
@@ -34,6 +34,37 @@ spam_processing: set = set()
 AUTH_PATTERN = re.compile(
     r'^名前\s*[:：]\s*.+\n作曲\s*[:：]\s*.+\n一言\s*[:：]\s*.+$',
     re.MULTILINE
+)
+
+# 三みりちゃん呼びかけ検知パターン（前に文字列があっても検知）
+SANMIRICHAN_CALL_PATTERN = re.compile(
+    r'(?:(?:おーい|おい|ね[ぇえ])[、,]?\s*)?(?:3|３|三|サン|さん)(?:ミリ|みり)ちゃん'
+)
+
+# おやすみ呼びかけ検知パターン
+OYASUMI_CALL_PATTERN = re.compile(
+    r'おやすみ[ー〜]?[、,]?\s*(?:3|３|三|サン|さん)(?:ミリ|みり)ちゃん'
+)
+
+# おはよう呼びかけ検知パターン（各種挨拶表記に対応）
+OHAYO_CALL_PATTERN = re.compile(
+    r'(?:おはようございます|おはよ[うー〜]?|およはう|おはうよ|はうおよ)[、,]?\s*(?:3|３|三|サン|さん)(?:ミリ|みり)ちゃん'
+)
+
+# 朝だよ呼びかけ検知パターン
+ASADAYO_CALL_PATTERN = re.compile(
+    r'朝だよ[ー〜]?[、,]?\s*(?:3|３|三|サン|さん)(?:ミリ|みり)ちゃん'
+)
+
+# 夜だよ呼びかけ検知パターン
+YORUDAYO_CALL_PATTERN = re.compile(
+    r'夜だよ[ー〜]?[、,]?\s*(?:3|３|三|サン|さん)(?:ミリ|みり)ちゃん'
+)
+
+# Hey Yo呼びかけ検知パターン
+HEYYO_CALL_PATTERN = re.compile(
+    r'hey\s*yo[！!]*[、,]?\s*(?:3|３|三|サン|さん)(?:ミリ|みり)ちゃん',
+    re.IGNORECASE
 )
 
 # Intents（必要な権限）の設定
@@ -712,6 +743,39 @@ async def on_message(message: discord.Message):
             user_message_log[user_id].clear()
             asyncio.create_task(handle_spam(message, spam_messages))
             return
+
+    # おやすみ三ミリちゃんに対する返信
+    if OYASUMI_CALL_PATTERN.search(message.content):
+        await message.channel.send('おやすみぃ〜')
+        return
+
+    # 朝だよさんみりちゃんに対する返信（ランダムで返信）
+    if ASADAYO_CALL_PATTERN.search(message.content):
+        reply = random.choice(['まだ寝たいよぉ〜', 'おはよぉ〜', 'あと5分だけぇ〜', 'は〜い'])
+        await message.channel.send(reply)
+        return
+
+    # おはようさんみりちゃんに対する返信
+    if OHAYO_CALL_PATTERN.search(message.content):
+        await message.channel.send('おはよぉ〜')
+        return
+
+    # 夜だよさんみりちゃんに対する返信（ランダムでどちらか一方を返信）
+    if YORUDAYO_CALL_PATTERN.search(message.content):
+        reply = random.choice(['眠いよぉ〜', 'まだ寝たくないよぉ〜'])
+        await message.channel.send(reply)
+        return
+
+    # Hey Yoさんみりちゃんに対する返信
+    if HEYYO_CALL_PATTERN.search(message.content):
+        await message.channel.send('Hey Yo！！')
+        return
+
+    # 三みりちゃん呼びかけに対する返信（前に文字列があっても検知、ランダム返答）
+    if SANMIRICHAN_CALL_PATTERN.search(message.content):
+        reply = random.choice(['なんだよぉ〜', '呼んだ〜？', 'どうしたのぉ〜？', 'はーい', 'なぁにぃ〜？'])
+        await message.channel.send(reply)
+        return
 
     # 認証チャンネル以外のメッセージは無視
     if message.channel.id != AUTH_CHANNEL_ID:
