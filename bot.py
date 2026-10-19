@@ -1,10 +1,12 @@
 import discord
 import re
 import os
+import json
 import asyncio
 import random
 from collections import defaultdict, deque
 from datetime import datetime, timezone, timedelta
+from typing import Optional, Tuple
 from dotenv import load_dotenv
 
 # .envファイルから環境変数を読み込む
@@ -15,6 +17,347 @@ AUTH_CHANNEL_ID = 1514441527609266318
 AUTH_ROLE_ID    = 1514453293357727795
 MUTE_ROLE_ID    = 1541338109801664562
 LOG_CHANNEL_ID  = 1542367134556885042
+
+# BUMPトラッキング設定
+# DISBOARDの/bumpコマンドを受け付けるチャンネルID
+BUMP_CHANNEL_ID      = 1514455961312559244 # ← bumpを打つチャンネルID を入力
+# BUMP回数の記録を送信するチャンネルID
+BUMP_LOG_CHANNEL_ID  = 1560829629621608508  # ← 記録先チャンネルID を入力
+# DISBOARDのBot ID（固定・変更不要）
+DISBOARD_BOT_ID      = 302050872383242240
+
+# BUMPロール設定: (最低回数, ロールID, ロール名称)
+# 各タプルは「この回数以上で付与するロール」を表す（降順で評価）
+# ロールIDを 0 にするとそのランクのロール付与をスキップ
+BUMP_ROLES = [
+    (200, 1560646289404731453, '伝説'),    # 裏設定: 200回以上  ← ロールID を入力
+    (100, 1560646067412795513, '殿堂入り'), #         100回以上  ← ロールID を入力
+    ( 70, 1560645880900489328, '達人'),    #          70回以上  ← ロールID を入力
+    ( 50, 1560645122956337343, '特級'),    #          50回以上  ← ロールID を入力
+    ( 30, 1560642466175131739, '上級'),    #          30回以上  ← ロールID を入力
+    ( 10, 1560644910686797886, '中級'),    #          10回以上  ← ロールID を入力
+    (  1, 1560644811973861436, '駆け出し'), #           1回以上  ← ロールID を入力
+]
+
+# BUMPデータ保存先ファイル
+BUMP_DATA_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)), 'bump_data.json')
+
+
+def load_bump_data() -> dict:
+    """bump_data.json からBUMPカウントデータを読み込む。ファイルがなければ空辞書を返す。"""
+    if not os.path.exists(BUMP_DATA_FILE):
+        return {}
+    try:
+        with open(BUMP_DATA_FILE, 'r', encoding='utf-8') as f:
+            return json.load(f)
+    except (json.JSONDecodeError, OSError) as e:
+        print(f'[BUMP] データ読み込みエラー: {e}')
+        return {}
+
+
+def save_bump_data(data: dict):
+    """BUMPカウントデータを bump_data.json に書き出す。"""
+    try:
+        with open(BUMP_DATA_FILE, 'w', encoding='utf-8') as f:
+            json.dump(data, f, ensure_ascii=False, indent=2)
+    except OSError as e:
+        print(f'[BUMP] データ保存エラー: {e}')
+
+
+async def fetch_bump_records_from_channel(guild: discord.Guild, include_test: bool = False):
+    """bump_logチャンネルのメッセージ履歴からBUMP記録Embedを読み込み、ユーザー名によって統合したデータを返す。
+    永続化ストレージ（ローカルファイル保存）がない環境でも、Discordチャンネル履歴から過去の記録を復元・統合する。
+    include_test=False の場合、テストBUMP（タイトルに [TEST] を含むもの）を集計対象外にする。
+    
+    戻り値:
+        counts_by_id:   {user_id_str: count}
+        counts_by_name: {clean_user_name: count}
+        display_names:  {key: display_name}
+        id_to_name_key: {user_id_str: clean_user_name}
+    """
+    if not BUMP_LOG_CHANNEL_ID:
+        local_data = load_bump_data()
+        return local_data, {}, {}, {}
+
+    try:
+        channel = guild.get_channel(BUMP_LOG_CHANNEL_ID)
+        if channel is None:
+            channel = await guild.fetch_channel(BUMP_LOG_CHANNEL_ID)
+    except Exception as e:
+        print(f'[BUMP] ログチャンネル取得失敗: {e}')
+        local_data = load_bump_data()
+        return local_data, {}, {}, {}
+
+    if not channel:
+        local_data = load_bump_data()
+        return local_data, {}, {}, {}
+
+    # ユーザー名（正規化）でグループ化して統合
+    user_groups = {}
+    id_to_name_key = {}
+
+    try:
+        async for msg in channel.history(limit=1000):
+            if not msg.embeds:
+                continue
+
+            for emb in msg.embeds:
+                if not emb.title or "BUMP記録" not in emb.title:
+                    continue
+
+                # テストBUMPログの除外判定
+                if not include_test and ("[TEST]" in emb.title or "TEST" in emb.title):
+                    continue
+
+                extracted_id = None
+                extracted_name = emb.author.name if emb.author and emb.author.name else None
+                extracted_count = None
+
+                for field in emb.fields:
+                    if 'ユーザー' in field.name:
+                        m = re.search(r'<@!?(\d+)>', field.value)
+                        if m:
+                            extracted_id = m.group(1)
+                    elif 'BUMP回数' in field.name:
+                        m = re.search(r'(\d+)', field.value)
+                        if m:
+                            extracted_count = int(m.group(1))
+
+                # ユーザーの特定キーを決定（表示名 / ユーザー名ベースで統合）
+                raw_name = extracted_name
+                if not raw_name and extracted_id:
+                    m_obj = guild.get_member(int(extracted_id))
+                    if m_obj:
+                        raw_name = m_obj.display_name
+                    else:
+                        raw_name = f"User_{extracted_id}"
+
+                if not raw_name:
+                    continue
+
+                clean_name = raw_name.strip().lower()
+
+                if clean_name not in user_groups:
+                    user_groups[clean_name] = {
+                        "display_name": raw_name.strip(),
+                        "user_id": extracted_id,
+                        "embed_count": 0,
+                        "max_field_count": 0
+                    }
+
+                group = user_groups[clean_name]
+                group["embed_count"] += 1
+                if extracted_id and not group["user_id"]:
+                    group["user_id"] = extracted_id
+                if extracted_count is not None:
+                    group["max_field_count"] = max(group["max_field_count"], extracted_count)
+
+                if extracted_id:
+                    id_to_name_key[extracted_id] = clean_name
+
+    except Exception as e:
+        print(f'[BUMP] チャンネル履歴取得エラー: {e}')
+
+    # 各グループのカウントを確定（ログ件数と記載回数の最大値の大きい方を採用）
+    counts_by_id = {}
+    counts_by_name = {}
+    display_names = {}
+
+    for clean_name, info in user_groups.items():
+        final_count = max(info["embed_count"], info["max_field_count"])
+        counts_by_name[clean_name] = final_count
+        disp_name = info["display_name"]
+        uid = info["user_id"]
+
+        if uid:
+            counts_by_id[uid] = final_count
+            display_names[uid] = disp_name
+        else:
+            display_names[clean_name] = disp_name
+
+    return counts_by_id, counts_by_name, display_names, id_to_name_key
+
+
+def get_bump_rank(count: int) -> Tuple[str, Optional[int]]:
+    """BUMP回数から (ロール名称, ロールID) を返す。該当なしは ('', None)。"""
+    for threshold, role_id, label in BUMP_ROLES:
+        if count >= threshold:
+            return label, role_id
+    return '', None
+
+
+async def apply_bump_role(member: discord.Member, new_label: str, new_role_id: Optional[int], guild: discord.Guild):
+    """新しいランクのロールを付与し、下位ランクのロールをすべて剥奪する。"""
+    if not new_role_id:
+        return
+    new_role = guild.get_role(new_role_id)
+    if not new_role:
+        return
+
+    # 下位ロールを剥奪（新しいロール以外のBUMPロールをすべて外す）
+    roles_to_remove = []
+    for _, rid, _ in BUMP_ROLES:
+        if rid and rid != new_role_id:
+            r = guild.get_role(rid)
+            if r and r in member.roles:
+                roles_to_remove.append(r)
+
+    try:
+        if roles_to_remove:
+            await member.remove_roles(*roles_to_remove, reason='BUMPランクアップによる旧ロール剥奪')
+        if new_role not in member.roles:
+            await member.add_roles(new_role, reason=f'BUMPランク: {new_label}')
+    except discord.Forbidden:
+        print(f'[BUMP] ロール操作権限なし: {member} ({member.id})')
+    except Exception as e:
+        print(f'[BUMP] ロール操作エラー: {e}')
+
+
+async def handle_bump(message: discord.Message):
+    """DISBOARDのbump完了メッセージを検知してカウント・ロール付与・ログ送信を行う。"""
+    guild = message.guild
+    if not guild:
+        return
+
+    # DISBOARDのbump完了Embedから実行者を特定
+    # ① スラッシュコマンド形式（新形式）: message.interaction または message.interaction_metadata からユーザーIDを取得
+    # ② 旧形式: Embedのdescriptionに <@ユーザーID> が含まれる場合
+    bumper_id = None
+
+    # 新形式: message.interaction（discord.py 2.x）
+    if hasattr(message, 'interaction') and message.interaction is not None:
+        bumper_id = message.interaction.user.id
+
+    # 新形式: message.interaction_metadata（discord.py 2.4+）
+    if bumper_id is None and hasattr(message, 'interaction_metadata') and message.interaction_metadata is not None:
+        bumper_id = getattr(message.interaction_metadata, 'user', None)
+        if bumper_id is not None:
+            bumper_id = bumper_id.id
+
+    # 旧形式: Embedのdescriptionの <@ユーザーID> メンション
+    if bumper_id is None:
+        for embed in message.embeds:
+            desc = embed.description or ''
+            m = re.search(r'<@!?(\d+)>', desc)
+            if m:
+                bumper_id = int(m.group(1))
+                break
+
+    if bumper_id is None:
+        print('[BUMP] bumper_id を特定できませんでした（embed/interaction いずれにも情報なし）')
+        return
+
+    # メンバー情報取得
+    try:
+        member = guild.get_member(bumper_id) or await guild.fetch_member(bumper_id)
+    except discord.NotFound:
+        print(f'[BUMP] ユーザーが見つかりません: {bumper_id}')
+        return
+
+    await process_bump_for_member(member, guild)
+
+
+async def process_bump_for_member(member: discord.Member, guild: discord.Guild, is_test: bool = False):
+    """BUMPのコアロジック: カウント更新・ランク判定・ロール付与・ログ送信。
+    handle_bump および /bump テストコマンドの両方から呼ばれる。
+    is_test=True の場合はログタイトルに [TEST] を付加する。
+    """
+    # bump_logチャンネル履歴から最新データを取得してユーザー名・IDで統合
+    counts_by_id, counts_by_name, _, _ = await fetch_bump_records_from_channel(guild)
+    key = str(member.id)
+    clean_name = member.display_name.strip().lower()
+
+    # 既存カウントを特定（ユーザーIDまたはユーザー名から）
+    prev_count = 0
+    if key in counts_by_id:
+        prev_count = counts_by_id[key]
+    elif clean_name in counts_by_name:
+        prev_count = counts_by_name[clean_name]
+    else:
+        # ローカルファイルがあればそこからもフォールバック
+        local_data = load_bump_data()
+        prev_count = local_data.get(key, 0)
+
+    count = prev_count + 1
+
+    # ローカルファイルにもキャッシュとして保存（永続ストレージがある環境用）
+    local_data = load_bump_data()
+    local_data[key] = count
+    save_bump_data(local_data)
+
+    # ランク判定とロール付与
+    new_label, new_role_id = get_bump_rank(count)
+    old_count = count - 1
+    old_label, _ = get_bump_rank(old_count)
+    rank_up = new_label != old_label and new_label != ''
+
+    if new_label and not is_test:
+        await apply_bump_role(member, new_label, new_role_id, guild)
+
+    # BUMPログチャンネルへ記録
+    if BUMP_LOG_CHANNEL_ID:
+        try:
+            log_ch = guild.get_channel(BUMP_LOG_CHANNEL_ID) or await guild.fetch_channel(BUMP_LOG_CHANNEL_ID)
+            if log_ch:
+                rank_emoji = {
+                    '駆け出し': '🌱', '中級': '🔥', '上級': '⚡',
+                    '特級': '💎', '達人': '🏆', '殿堂入り': '👑', '伝説': '🌟'
+                }
+                emoji = rank_emoji.get(new_label, '📌')
+
+                rank_colors = {
+                    '駆け出し': 0x7cbb5e, '中級': 0xf5a623, '上級': 0x4a90e2,
+                    '特級': 0x9b59b6, '達人': 0xe74c3c, '殿堂入り': 0xf1c40f, '伝説': 0xff6b9d
+                }
+                color = rank_colors.get(new_label, 0x95a5a6)
+
+                title = ('🧪 [TEST] BUMP記録' if is_test else '🔔 BUMP記録')
+                embed = discord.Embed(
+                    title=title,
+                    color=color,
+                    timestamp=datetime.now(timezone.utc)
+                )
+                embed.set_author(name=member.display_name, icon_url=member.display_avatar.url)
+                embed.add_field(name='ユーザー', value=member.mention, inline=True)
+                embed.add_field(name='BUMP回数', value=f'**{count}回**', inline=True)
+
+                if new_label:
+                    embed.add_field(
+                        name='現在のランク',
+                        value=f'{emoji} **{new_label}**',
+                        inline=True
+                    )
+
+                if rank_up:
+                    embed.add_field(
+                        name='🎉 ランクアップ！',
+                        value=f'{old_label or "なし"} → **{new_label}**',
+                        inline=False
+                    )
+                    if new_label == '伝説':
+                        embed.set_footer(text='✨ 伝説の称号を解禁しました...')
+
+                await log_ch.send(embed=embed)
+
+                # ランクアップ時はbumpチャンネルにも通知
+                if rank_up and BUMP_CHANNEL_ID:
+                    bump_ch = guild.get_channel(BUMP_CHANNEL_ID)
+                    if bump_ch:
+                        if new_label == '伝説':
+                            notif = await bump_ch.send(
+                                f'🌟 {member.mention} が **伝説** の称号を解放した...！すごすぎる...'
+                            )
+                        else:
+                            notif = await bump_ch.send(
+                                f'🎉 {member.mention} が **{new_label}** にランクアップしたよ！おめでとう！'
+                            )
+                        await asyncio.sleep(10)
+                        await safe_delete(notif)
+        except Exception as e:
+            print(f'[BUMP] ログ送信エラー: {e}')
+
+    tag = '[BUMP/TEST]' if is_test else '[BUMP]'
+    print(f'{tag} {member} ({member.id}) BUMP回数: {count}回 / ランク: {new_label or "なし"}')
 
 # スパム検知の設定
 SPAM_THRESHOLD = 5     # この件数以上でスパム判定
@@ -32,39 +375,49 @@ spam_processing: set = set()
 # 作曲 : 〇〇
 # 一言 : 〇〇
 AUTH_PATTERN = re.compile(
-    r'^名前\s*[:：]\s*.+\n作曲\s*[:：]\s*.+\n一言\s*[:：]\s*.+$',
+    r'^名前\s*(?:[:：]\s*|\s+).+\n作曲\s*(?:[:：]\s*|\s+).+\n一言\s*(?:[:：]\s*|\s+).+$',
     re.MULTILINE
 )
 
 # 三みりちゃん呼びかけ検知パターン（前に文字列があっても検知）
 SANMIRICHAN_CALL_PATTERN = re.compile(
-    r'(?:(?:おーい|おい|ね[ぇえ])[、,]?\s*)?(?:3|３|三|サン|さん)(?:ミリ|みり)ちゃん'
+    r'(?:(?:おーい|おい|ね[ぇえ])[、,]?\s*)?(?:3|３|三|サン|さん)(?:ミリ|みり)ちゃ[ー〜～]*ん[ー〜～]*'
 )
 
 # おやすみ呼びかけ検知パターン
 OYASUMI_CALL_PATTERN = re.compile(
-    r'おやすみ[ー〜]?[、,]?\s*(?:3|３|三|サン|さん)(?:ミリ|みり)ちゃん'
+    r'おやすみ[ー〜]?[、,]?\s*(?:3|３|三|サン|さん)(?:ミリ|みり)ちゃ[ー〜～]*ん[ー〜～]*'
 )
 
 # おはよう呼びかけ検知パターン（各種挨拶表記に対応）
 OHAYO_CALL_PATTERN = re.compile(
-    r'(?:おはようございます|おはよ[うー〜]?|およはう|おはうよ|はうおよ)[、,]?\s*(?:3|３|三|サン|さん)(?:ミリ|みり)ちゃん'
+    r'(?:おはようございます|おはよ[うー〜]?|およはう|おはうよ|はうおよ)[、,]?\s*(?:3|３|三|サン|さん)(?:ミリ|みり)ちゃ[ー〜～]*ん[ー〜～]*'
 )
 
 # 朝だよ呼びかけ検知パターン
 ASADAYO_CALL_PATTERN = re.compile(
-    r'朝だよ[ー〜]?[、,]?\s*(?:3|３|三|サン|さん)(?:ミリ|みり)ちゃん'
+    r'朝だよ[ー〜]?[、,]?\s*(?:3|３|三|サン|さん)(?:ミリ|みり)ちゃ[ー〜～]*ん[ー〜～]*'
 )
 
 # 夜だよ呼びかけ検知パターン
 YORUDAYO_CALL_PATTERN = re.compile(
-    r'夜だよ[ー〜]?[、,]?\s*(?:3|３|三|サン|さん)(?:ミリ|みり)ちゃん'
+    r'夜だよ[ー〜]?[、,]?\s*(?:3|３|三|サン|さん)(?:ミリ|みり)ちゃ[ー〜～]*ん[ー〜～]*'
 )
 
 # Hey Yo呼びかけ検知パターン
 HEYYO_CALL_PATTERN = re.compile(
-    r'hey\s*yo[！!]*[、,]?\s*(?:3|３|三|サン|さん)(?:ミリ|みり)ちゃん',
+    r'hey\s*yo[！!]*[、,]?\s*(?:3|３|三|サン|さん)(?:ミリ|みり)ちゃ[ー〜～]*ん[ー〜～]*',
     re.IGNORECASE
+)
+
+# お疲れ呼びかけ検知パターン
+OTSUKARE_CALL_PATTERN = re.compile(
+    r'お(?:疲れ|つかれ)(?:様|さま)?[ー〜]?[、,]?\s*(?:3|３|三|サン|さん)(?:ミリ|みり)ちゃ[ー〜～]*ん[ー〜～]*'
+)
+
+# ありがとう呼びかけ検知パターン
+ARIGATOU_CALL_PATTERN = re.compile(
+    r'(?:ありがとう|ありがと)[ー〜]?(?:ございます|ございました)?[、,]?\s*(?:3|３|三|サン|さん)(?:ミリ|みり)ちゃ[ー〜～]*ん[ー〜～]*'
 )
 
 # Intents（必要な権限）の設定
@@ -294,10 +647,26 @@ async def delete_messages_after(messages: list, delay_seconds: int = 600):
         await safe_delete(msg)
 
 
-async def send_log_results(channel: discord.TextChannel, query: str, trigger_message: discord.Message = None):
-    """ログチャンネル内のメッセージ履歴から該当ログを検索して表示し、600秒後にコマンド文と返信メッセージを自動削除する"""
+async def send_log_results(
+    channel: discord.TextChannel,
+    query: str,
+    trigger_message: discord.Message = None,
+    interaction: discord.Interaction = None,
+):
+    """ログチャンネル内のメッセージ履歴から該当ログを検索して表示し、300秒後にコマンド文と返信メッセージを自動削除する"""
     matched_embeds = await search_channel_logs(channel, query)
     sent_messages = []
+
+    # スラッシュコマンド経由かどうか（deferred interactionへのfollowup送信に使う）
+    first_sent = False
+
+    async def _send(embeds: list) -> discord.Message:
+        """スラッシュコマンド経由の最初のメッセージはfollowup、以降はchannel.sendで送る"""
+        nonlocal first_sent
+        if interaction and not first_sent:
+            first_sent = True
+            return await interaction.followup.send(embeds=embeds)
+        return await channel.send(embeds=embeds)
 
     if not matched_embeds:
         no_res_embed = discord.Embed(
@@ -305,7 +674,7 @@ async def send_log_results(channel: discord.TextChannel, query: str, trigger_mes
             description="❌ 該当するユーザーログは見つかりませんでした。",
             color=discord.Color.light_grey()
         )
-        res_msg = await channel.send(embed=no_res_embed)
+        res_msg = await _send([no_res_embed])
         sent_messages.append(res_msg)
     else:
         # 件数内訳の集計
@@ -336,10 +705,10 @@ async def send_log_results(channel: discord.TextChannel, query: str, trigger_mes
         chunks = [to_send[i:i + chunk_size] for i in range(0, len(to_send), chunk_size)]
 
         for chunk in chunks:
-            msg = await channel.send(embeds=chunk)
+            msg = await _send(chunk)
             sent_messages.append(msg)
 
-    # 600秒後に実行コマンド文およびBotの返信を自動削除
+    # 300秒後に実行コマンド文およびBotの返信を自動削除
     targets_to_delete = []
     if trigger_message:
         targets_to_delete.append(trigger_message)
@@ -396,7 +765,7 @@ async def handle_spam(trigger_message: discord.Message, spam_messages: list):
 
         # スパム検知チャンネルへメッセージを送信（削除せず残す）
         try:
-            await channel.send('うるさいのぉ')
+            await channel.send('うるさいよぉ〜')
         except Exception as msg_err:
             print(f'[SPAM] 警告メッセージ送信失敗: {msg_err}')
 
@@ -543,12 +912,12 @@ async def slash_logs(interaction: discord.Interaction, user: str):
         await interaction.response.send_message('⚠️ このコマンドは管理者のみ使用できます。', ephemeral=True)
         return
     await interaction.response.defer()
-    await send_log_results(interaction.channel, user.strip())
+    await send_log_results(interaction.channel, user.strip(), interaction=interaction)
 
 
 @tree.command(name="greeting", description="Botが挨拶を返すよ")
 async def slash_greeting(interaction: discord.Interaction):
-    await interaction.response.send_message('こんちくわ、今日も頑張ろ。')
+    await interaction.response.send_message('こんちくわ、今日も頑張ろぉ〜')
 
 
 @tree.command(name="kese", description="指定した行数を削除できるよ。")
@@ -579,6 +948,96 @@ async def slash_kese(interaction: discord.Interaction, count: int):
         print(f'[KESE] メッセージ削除エラー: {e}')
 
 
+@tree.command(name="bump", description="BUMPをテストするよ（管理者のみ）")
+@discord.app_commands.describe(target="BUMPを記録するユーザー（省略時は実行者）")
+async def slash_bump_test(interaction: discord.Interaction, target: Optional[discord.Member] = None):
+    """テスト用BUMPコマンド。管理者のみ実行可能。実際のカウントとロールに反映される。"""
+    if not (isinstance(interaction.user, discord.Member) and interaction.user.guild_permissions.administrator):
+        await interaction.response.send_message('⚠️ このコマンドは管理者のみ使用できます。', ephemeral=True)
+        return
+    await interaction.response.defer(ephemeral=True)
+    member = target or interaction.user
+    try:
+        await process_bump_for_member(member, interaction.guild, is_test=True)
+        await interaction.followup.send(
+            f'🧪 テストBUMP完了！{member.mention} のBUMPを1回記録したよ。ログチャンネルを確認してね。',
+            ephemeral=True
+        )
+    except Exception as e:
+        await interaction.followup.send(f'❌ エラーが発生しました: {e}', ephemeral=True)
+        print(f'[BUMP/TEST] エラー: {e}')
+
+
+@tree.command(name="bump_ranking", description="BUMPランキングを表示するよ（管理者のみ）")
+async def slash_bump_ranking(interaction: discord.Interaction):
+    if not (isinstance(interaction.user, discord.Member) and interaction.user.guild_permissions.administrator):
+        await interaction.response.send_message('⚠️ このコマンドは管理者のみ使用できます。', ephemeral=True)
+        return
+    await interaction.response.defer(ephemeral=True)
+
+    guild = interaction.guild
+    if not guild:
+        await interaction.followup.send('サーバー情報を取得できませんでした。', ephemeral=True)
+        return
+
+    counts_by_id, counts_by_name, display_names, id_to_name_key = await fetch_bump_records_from_channel(guild, include_test=False)
+
+    # ユーザー名によって統合したランキングエントリを構築
+    ranking_entries = []
+    seen_names = set()
+
+    for uid, cnt in counts_by_id.items():
+        name_key = id_to_name_key.get(uid, uid)
+        if name_key in seen_names:
+            continue
+        seen_names.add(name_key)
+        disp_name = display_names.get(uid)
+        if not disp_name:
+            m = guild.get_member(int(uid)) if uid.isdigit() else None
+            disp_name = m.display_name if m else f'ID:{uid}'
+        ranking_entries.append((disp_name, cnt))
+
+    for clean_name, cnt in counts_by_name.items():
+        if clean_name in seen_names:
+            continue
+        seen_names.add(clean_name)
+        disp_name = display_names.get(clean_name, clean_name)
+        ranking_entries.append((disp_name, cnt))
+
+    # チャンネルから取得できなかった場合のローカルファイルフォールバック
+    if not ranking_entries:
+        local_data = load_bump_data()
+        for uid, cnt in local_data.items():
+            m = guild.get_member(int(uid)) if uid.isdigit() else None
+            disp_name = m.display_name if m else f'ID:{uid}'
+            ranking_entries.append((disp_name, cnt))
+
+    if not ranking_entries:
+        await interaction.followup.send('まだBUMPデータがありません。', ephemeral=True)
+        return
+
+    # 回数の多い順にソート
+    ranking_entries.sort(key=lambda x: x[1], reverse=True)
+
+    lines = []
+    for i, (name, cnt) in enumerate(ranking_entries[:20], 1):
+        label, _ = get_bump_rank(cnt)
+        rank_emoji = {
+            '駆け出し': '🌱', '中級': '🔥', '上級': '⚡',
+            '特級': '💎', '達人': '🏆', '殿堂入り': '👑', '伝説': '🌟'
+        }
+        emoji = rank_emoji.get(label, '▫️')
+        medal = ['🥇', '🥈', '🥉'][i - 1] if i <= 3 else f'{i}.'
+        lines.append(f'{medal} {name} — **{cnt}回** {emoji} {label}')
+
+    embed = discord.Embed(
+        title='📊 BUMPランキング',
+        description='\n'.join(lines),
+        color=0xf1c40f
+    )
+    await interaction.followup.send(embed=embed, ephemeral=True)
+
+
 @client.event
 async def on_ready():
     print(f'✅ ログイン成功')
@@ -600,7 +1059,7 @@ async def on_ready():
             print('🔍 過去のメッセージを確認中...')
             newly_authenticated_members = []
 
-            async for message in channel.history(limit=100):
+            async for message in channel.history(limit=25):
                 if message.author.bot:
                     continue
 
@@ -646,7 +1105,7 @@ async def on_ready():
                 # 全員のメンションをスペース区切りでつなげる
                 mentions = " ".join([m.mention for m in newly_authenticated_members])
                 notice = await channel.send(
-                    f'✅ {mentions}\n過去の書き込みからまとめて認証を完了！平和にね。'
+                    f'✅ {mentions}\n過去の書き込みからまとめて認証を完了！仲良くしてねぇ〜'
                 )
                 # 複数人へのメンションなので少し長めの10秒後にメッセージを削除
                 await asyncio.sleep(10)
@@ -659,7 +1118,21 @@ async def on_ready():
 @client.event
 async def on_message(message: discord.Message):
     # Bot自身のメッセージおよびサーバー外(DM)は無視
-    if message.author.bot or message.guild is None:
+    if message.guild is None:
+        return
+
+    # DISBOARDのBUMP完了メッセージを検知
+    if (
+        message.author.id == DISBOARD_BOT_ID
+        and BUMP_CHANNEL_ID
+        and message.channel.id == BUMP_CHANNEL_ID
+        and message.embeds
+    ):
+        asyncio.create_task(handle_bump(message))
+        return
+
+    # Bot自身のメッセージは以降の処理をスキップ
+    if message.author.bot:
         return
 
     # /logs コマンド処理（logsチャンネル限定・管理者のみ）
@@ -673,7 +1146,24 @@ async def on_message(message: discord.Message):
 
     # /greeting コマンド処理
     if message.content.strip() == '/greeting':
-        await message.channel.send('こんちくわ、今日も頑張ろ。')
+        await message.channel.send('こんちくわ、今日も頑張ろぉ〜')
+        return
+
+    # /bump テキストコマンド処理（テスト用・管理者のみ・BUMPチャンネル限定）
+    if message.content.strip() == '/bump':
+        if not (isinstance(message.author, discord.Member) and message.author.guild_permissions.administrator):
+            return
+        if BUMP_CHANNEL_ID and message.channel.id != BUMP_CHANNEL_ID:
+            await message.channel.send('⚠️ `/bump` テストはBUMPチャンネルでのみ使えるよ。', delete_after=5)
+            return
+        member = message.author
+        try:
+            await process_bump_for_member(member, message.guild, is_test=True)
+            done = await message.channel.send(f'🧪 テストBUMP完了！{member.mention} のBUMPを1回記録したよ。')
+            await asyncio.sleep(3)
+            await safe_delete(done)
+        except Exception as e:
+            print(f'[BUMP/TEST] テキストコマンドエラー: {e}')
         return
 
     # /kese <件数> コマンド処理（管理者のみ・実行チャンネルのメッセージを指定件数削除）
@@ -771,6 +1261,16 @@ async def on_message(message: discord.Message):
         await message.channel.send('Hey Yo！！')
         return
 
+    # お疲れさんみりちゃんに対する返信
+    if OTSUKARE_CALL_PATTERN.search(message.content):
+        await message.channel.send('ありがとぉ〜')
+        return
+
+    # ありがとうさんみりちゃんに対する返信
+    if ARIGATOU_CALL_PATTERN.search(message.content):
+        await message.channel.send('こちらこそぉ〜')
+        return
+
     # 三みりちゃん呼びかけに対する返信（前に文字列があっても検知、ランダム返答）
     if SANMIRICHAN_CALL_PATTERN.search(message.content):
         reply = random.choice(['なんだよぉ〜', '呼んだ〜？', 'どうしたのぉ〜？', 'はーい', 'なぁにぃ〜？'])
@@ -821,7 +1321,7 @@ async def on_message(message: discord.Message):
 
             # 成功通知（5秒後にBotのメッセージのみ削除）
             notice = await message.channel.send(
-                f'✅ {message.author.mention} 認証成功！平和にね。'
+                f'✅ {message.author.mention} 認証成功！仲良くしてねぇ〜'
             )
             await asyncio.sleep(5)
             await notice.delete()
